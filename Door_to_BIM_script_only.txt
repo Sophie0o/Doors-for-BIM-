@@ -1,0 +1,401 @@
+import bpy
+import os
+import re
+import requests
+from urllib.request import urlopen
+from lxml import html
+import cv2
+import numpy as np
+from io import BytesIO
+import bmesh
+from mathutils import Vector
+
+# create Add-On
+class AddProductOperator(bpy.types.Operator):
+    bl_idname = "object.add_product"
+    bl_label = "Add Product"
+
+    def execute(self, context):
+        entered_url = context.scene.product_url
+
+# main code with scraping function:
+        
+        # ensure BlenderBIM add-on is enabled
+        if not bpy.context.preferences.addons.get("blenderbim"):
+            bpy.ops.preferences.addon_enable(module="blenderbim")
+        
+        # create a new IFC project
+        bpy.ops.bim.create_project()
+
+        def scrape_inner_html(url, xpath):
+            try:
+                response = urlopen(url)
+                html_content = response.read().decode('utf-8')
+                tree = html.fromstring(html_content)
+                elements = tree.xpath(xpath)
+                data_list = []
+                if elements:
+                    selected_element = elements[0]
+                    strong_tags = selected_element.xpath('.//strong')
+                    for strong_tag in strong_tags:
+                        strong_text = strong_tag.text.strip()
+                        following_text = strong_tag.tail.strip() if strong_tag.tail else ''
+                        if following_text.startswith(':'):
+                            following_text = following_text[1:].strip()
+                        data_list.append((strong_text, following_text))
+                return data_list
+            except Exception as e:
+                print(f"Error scraping {url}: {e}")
+                return []
+
+        # search for product-information
+        def extract_product_name(url, name_xpath):
+            try:
+                response = urlopen(url)
+                html_content = response.read().decode('utf-8')
+                tree = html.fromstring(html_content)
+                name_element = tree.xpath(name_xpath)
+                if name_element:
+                    product_name = name_element[0].text.strip()
+                    return product_name
+                else:
+                    return None
+            except Exception as e:
+                print(f"Error extracting product name from {url}: {e}")
+                return None
+
+        def filter_and_find_max(data_list, search_terms):
+            filtered_list = [item for item in data_list if any(term.lower() in item[0].lower() for term in search_terms)]
+            
+            def extract_number(value):
+                match = re.search(r'\d+', value)
+                return int(match.group()) if match else None
+
+            numbers = [extract_number(item[1]) for item in filtered_list if extract_number(item[1]) is not None]
+            max_value = max(numbers) if numbers else None
+            
+            return filtered_list, max_value
+
+# download image and edit
+        def extract_first_image_url(url, image_xpath):
+            try:
+                response = urlopen(url)
+                html_content = response.read().decode('utf-8')
+                tree = html.fromstring(html_content)
+                image_element = tree.xpath(image_xpath)
+                if image_element:
+                    image_url = image_element[0].get('src')
+                    if image_url.startswith('//'):
+                        image_url = 'https:' + image_url
+                    return image_url
+                else:
+                    return None
+            except Exception as e:
+                print(f"Error extracting image URL from {url}: {e}")
+                return None
+
+        def download_image_to_memory(image_url):
+            try:
+                response = requests.get(image_url.split('?')[0])
+                image_data = BytesIO(response.content)
+                image = cv2.imdecode(np.frombuffer(image_data.read(), np.uint8), cv2.IMREAD_COLOR)
+                print(f"Image downloaded and loaded into memory")
+                return image
+            except Exception as e:
+                print(f"Error downloading image from {image_url}: {e}")
+                return None
+
+        # search for largest trapezoid to find the outline of the door
+        def resize_image(image, width, height):
+            if image is None:
+                raise ValueError("Image not found or unable to load")
+            resized_image = cv2.resize(image, (width, height), interpolation=cv2.INTER_AREA)
+            return resized_image
+
+        def find_and_crop_largest_trapezoid(image, output_cropped_path):
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+            edged = cv2.Canny(blurred, 50, 150)
+            contours, _ = cv2.findContours(edged, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+
+            largest_trapezoid = None
+            max_area = 0
+
+            for contour in contours:
+                perimeter = cv2.arcLength(contour, True)
+                approx = cv2.approxPolyDP(contour, 0.02 * perimeter, True)
+                if len(approx) == 4:
+                    area = cv2.contourArea(approx)
+                    if area > max_area:
+                        max_area = area
+                        largest_trapezoid = approx
+
+            if largest_trapezoid is not None:
+                x, y, w, h = cv2.boundingRect(largest_trapezoid)
+                cropped = image[y:y+h, x:x+w]
+                cv2.imwrite(output_cropped_path, cropped)
+            else:
+                cv2.imwrite(output_cropped_path, image)
+
+# main Execution
+        url = entered_url
+        xpathselector = [
+            "/html/body/main/section[1]/section/div/div/div[2]/product-info/div[11]",
+            "/html/body/main/section[1]/section/div/div/div[2]/product-info/div[10]",
+            "/html/body/main/section[1]/section/div/div/div[2]/product-info/div[12]"
+        ]
+        name_xpath = "/html/body/main/section[1]/section/div/div/div[2]/product-info/div[1]/h1"
+        image_xpath = "/html/body/main/section[1]/section/div/div/div[1]/media-gallery/slider-component[1]/ul/li[1]/div/modal-opener/div[2]/img"
+
+        data_list = []
+        for xpath in xpathselector:
+            data_list.extend(scrape_inner_html(url, xpath))
+
+        product_name = extract_product_name(url, name_xpath)
+
+        terms = {'tiefe': ['tiefe'], 'länge': ['länge'], 'breite': ['breite'], 'höhe': ['höhe']}
+        results = {}
+
+        # check for 'tiefe' or fallback to 'länge'
+        filtered_list, max_value = filter_and_find_max(data_list, terms['tiefe'])
+        if not filtered_list:
+            filtered_list, max_value = filter_and_find_max(data_list, terms['länge'])
+        results['tiefe'] = (filtered_list, max_value)
+
+        for term in ['breite', 'höhe']:
+            filtered_list, max_value = filter_and_find_max(data_list, terms[term])
+            results[term] = (filtered_list, max_value)
+
+        max_tiefe = results['tiefe'][1]
+        max_breite = results['breite'][1]
+        max_hoehe = results['höhe'][1]
+
+        product_description = str(data_list).strip('[]')
+        values = [product_name] + [results[term][1] for term in ['tiefe', 'breite', 'höhe']]
+
+        # extract material information
+        material_terms = [item[1] for item in data_list if 'material' in item[0].lower()]
+        product_material = ', '.join(material_terms)
+        values.append(product_material)
+        values.append(product_description)
+
+        image_save_dir = os.path.join(bpy.path.abspath("//"), "one_door")
+        os.makedirs(image_save_dir, exist_ok=True)
+        image_url = extract_first_image_url(url, image_xpath)
+        cropped_image_path = None
+
+        if image_url:
+            image = download_image_to_memory(image_url)
+
+            resized_image = resize_image(image, width=300, height=400)
+            output_cropped_path = os.path.join(image_save_dir, "cropped_image.jpg")
+            find_and_crop_largest_trapezoid(resized_image, output_cropped_path)
+            cropped_image_path = output_cropped_path
+
+        values.append(cropped_image_path)
+        values.append(url)
+
+# Blender operations
+        bpy.ops.mesh.primitive_cube_add(size=1)
+        new_door = bpy.context.object
+
+        for vert in new_door.data.vertices:
+            vert.co[2] += 0.5
+            
+        # scale the object according to the extracted data
+        new_door.scale = (max_tiefe/1000, max_breite/1000, max_hoehe/1000)
+        new_door.name = product_name
+
+        # add image texture
+        def add_image_texture(obj, image_path):
+            bpy.context.view_layer.objects.active = obj
+            obj.select_set(True)
+
+            mat = bpy.data.materials.new(name="door_image")
+            mat.use_nodes = True
+            nodes = mat.node_tree.nodes
+            links = mat.node_tree.links
+
+            for node in nodes:
+                nodes.remove(node)
+
+            output_node = nodes.new(type='ShaderNodeOutputMaterial')
+            bsdf_node = nodes.new(type='ShaderNodeBsdfPrincipled')
+            texture_node = nodes.new(type='ShaderNodeTexImage')
+
+            texture_node.image = bpy.data.images.load(image_path)
+            texture_node.extension = 'CLIP'  
+            
+            links.new(bsdf_node.outputs['BSDF'], output_node.inputs['Surface'])
+            links.new(texture_node.outputs['Color'], bsdf_node.inputs['Base Color'])
+
+            if len(obj.data.materials):
+                obj.data.materials[0] = mat
+            else:
+                obj.data.materials.append(mat)
+
+        # set image as material
+        image_path = output_cropped_path
+
+        active_object = bpy.context.object
+        add_image_texture(active_object, image_path)
+
+# start UV mapping
+        def select_face_with_x_normal(obj, direction='positive'):
+
+            bpy.context.view_layer.objects.active = obj
+            bpy.ops.object.mode_set(mode='EDIT')
+                
+            bm = bmesh.from_edit_mesh(obj.data)
+
+            for face in bm.faces:
+                face.select = False
+                
+            # UV-mapping for the largest face with the normal along the x-axis
+            x_axis = Vector((1, 0, 0)) if direction == 'positive' else Vector((-1, 0, 0))
+            target_face = max(bm.faces, key=lambda f: f.normal.dot(x_axis))
+            target_face.select = True
+            bmesh.update_edit_mesh(obj.data)
+
+        def smart_uv_project_selected_face():
+            bpy.ops.object.mode_set(mode='EDIT')
+
+            # set UV-mapping to 'scale to bounds'
+            bpy.ops.uv.smart_project(island_margin=0.02, scale_to_bounds=True)
+                
+        def mirror_uv_map(constraint_axis=(True, False, False)):
+            bpy.ops.object.mode_set(mode='EDIT')
+
+            bpy.context.area.ui_type = 'UV'
+            bpy.ops.uv.select_all(action='SELECT')
+
+            bpy.ops.transform.mirror(constraint_axis=constraint_axis)
+
+        active_object = bpy.context.active_object
+        bpy.ops.object.mode_set(mode='OBJECT')
+        select_face_with_x_normal(active_object, direction='positive')
+        smart_uv_project_selected_face()
+            
+        # mirror the UV map along both X and Y axes
+        mirror_uv_map(constraint_axis=(True, True, False))
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+
+        def select_face_with_x_normal(obj, direction='negative'):
+            bpy.context.view_layer.objects.active = obj
+            bpy.ops.object.mode_set(mode='EDIT')
+            bm = bmesh.from_edit_mesh(obj.data)
+            for face in bm.faces:
+                face.select = False
+                
+            x_axis = Vector((-1, 0, 0)) if direction == 'negative' else Vector((1, 0, 0))
+            target_face = max(bm.faces, key=lambda f: f.normal.dot(-x_axis))
+            target_face.select = True
+            bmesh.update_edit_mesh(obj.data)
+
+        def smart_uv_project_selected_face():
+            bpy.ops.object.mode_set(mode='EDIT')
+            bpy.ops.uv.smart_project(island_margin=0.02, scale_to_bounds=True)
+                
+        def mirror_uv_map(constraint_axis=(True, False, False)):
+            bpy.ops.object.mode_set(mode='EDIT')
+            bpy.context.area.ui_type = 'UV'
+            bpy.ops.uv.select_all(action='SELECT')
+            bpy.ops.transform.mirror(constraint_axis=constraint_axis)
+            
+        active_object = bpy.context.active_object
+        bpy.ops.object.mode_set(mode='OBJECT')
+        select_face_with_x_normal(active_object, direction='positive')
+        smart_uv_project_selected_face()
+        mirror_uv_map(constraint_axis=(False, True, False))
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+
+# repeat UV mapping for -x-axis
+        def select_face_with_x_normal(obj, direction='negative'):
+            bpy.context.view_layer.objects.active = obj
+            bpy.ops.object.mode_set(mode='EDIT')
+            bm = bmesh.from_edit_mesh(obj.data)
+
+            for face in bm.faces:
+                face.select = False
+                
+            x_axis = Vector((-1, 0, 0)) if direction == 'negative' else Vector((1, 0, 0))
+            target_face = max(bm.faces, key=lambda f: f.normal.dot(-x_axis))
+            target_face.select = True
+            bmesh.update_edit_mesh(obj.data)
+
+        def smart_uv_project_selected_face():
+            bpy.ops.object.mode_set(mode='EDIT')
+            bpy.ops.uv.smart_project(island_margin=0.02, scale_to_bounds=True)
+            
+        # mirror only along the x-axis        
+        def mirror_uv_map(constraint_axis=(True, False, False)):
+            bpy.ops.object.mode_set(mode='EDIT')
+
+            bpy.context.area.ui_type = 'UV'
+            bpy.ops.uv.select_all(action='SELECT')
+
+            bpy.ops.transform.mirror(constraint_axis=constraint_axis)
+
+        active_object = bpy.context.active_object
+        bpy.ops.object.mode_set(mode='OBJECT')
+        select_face_with_x_normal(active_object, direction='positive')
+        smart_uv_project_selected_face()
+        mirror_uv_map(constraint_axis=(False, True, False))
+        bpy.ops.object.mode_set(mode='OBJECT')
+        
+        bpy.context.area.ui_type = 'TEXT_EDITOR'
+
+# assign IFC-class
+        bpy.ops.bim.assign_class(ifc_class="IfcDoorType", predefined_type="DOOR", userdefined_type="")
+
+        bpy.ops.bim.enable_editing_attributes(obj=new_door.name, obj_type="Object")
+        bpy.data.objects[new_door.name].BIMAttributeProperties.attributes[2].is_null = False
+        bpy.data.objects[new_door.name].BIMAttributeProperties.attributes[2].string_value = product_description
+        bpy.ops.bim.edit_attributes(obj=new_door.name, obj_type="Object")
+
+        # add material
+        bpy.ops.bim.add_material(obj=new_door.name, name= product_material)
+        
+        bpy.context.area.ui_type = 'VIEW_3D'
+
+        return {'FINISHED'}
+
+# design Add-On panel 
+class TestPanel(bpy.types.Panel):
+    bl_label = 'Add Product'
+    bl_idname = 'product_adder'
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = 'Add Product'
+    
+    def draw(self, context):
+        layout = self.layout
+        scene = context.scene
+        
+        row = layout.row()
+        row.label(text='Insert Product URL to generate')
+        row = layout.row()
+        row.prop(scene, "product_url", text="URL")
+        row = layout.row()
+        row.operator("object.add_product", text="Add")
+
+def register():
+    bpy.utils.register_class(AddProductOperator)
+    bpy.utils.register_class(TestPanel)
+    bpy.types.Scene.product_url = bpy.props.StringProperty(
+        name="Product URL",
+        description="Enter a product URL",
+        default=""
+    )
+
+def unregister():
+    bpy.utils.unregister_class(AddProductOperator)
+    bpy.utils.unregister_class(TestPanel)
+    del bpy.types.Scene.product_url
+
+if __name__ == '__main__':
+    register()
+
+print(entered_url)
