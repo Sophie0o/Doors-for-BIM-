@@ -1,2 +1,8 @@
-# Doors-for-BIM
-In this repository you can find a Blender python code that creates automatically reusable doors from Concular 
+# Reusable doors in BIM
+In this repository you can find a code for a Blender add-on that automatically creates a digital model of reusable doors from Concular 
+
+In the thesis you will find the detailed explanaition about the process and the creation of this add-on. 
+
+In the Blender file is the running add-on and in the .txt file is the entire script for it as well. 
+The add-on can be modified in the code in Blender's scripting environment. 
+Please note, that this project is a prototype and does not work for all doors in Concular. 
